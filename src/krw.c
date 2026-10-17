@@ -23,6 +23,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
@@ -697,6 +698,18 @@ main(int argc, char **argv)
     if (argc < 2 || strcmp(argv[1], "auto") != 0) {
         usage(argv[0]);
         return 2;
+    }
+
+    /* we need ~8k sockets for the spray; default soft limit is 256 */
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < 10240) {
+            rl.rlim_cur = (rl.rlim_max == RLIM_INFINITY ||
+                           rl.rlim_max > 10240) ? 10240 : rl.rlim_max;
+            if (setrlimit(RLIMIT_NOFILE, &rl) != 0)
+                fprintf(stderr, "[krw] warning: cannot raise RLIMIT_NOFILE: "
+                        "%s (spray may fail)\n", strerror(errno));
+        }
     }
     optind = 2;
     while ((ch = getopt_long(argc, argv, "c:s:w:S:W:f:i:n:p:r:t:h",

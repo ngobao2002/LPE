@@ -25,6 +25,9 @@
 set -u
 cd "$(dirname "$0")"
 
+# the spray needs ~8k sockets; default soft fd limit is 256
+ulimit -n 10240 2>/dev/null || ulimit -n 4096 2>/dev/null || true
+
 LHOST=127.0.0.1
 LPORT=1337
 MODE=full
